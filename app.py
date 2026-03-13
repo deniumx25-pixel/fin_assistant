@@ -49,7 +49,7 @@ try:
 except ImportError:
     GIGACHAT_AVAILABLE = False
 
-# --- Получение ключа GigaChat: сначала из переменной окружения, потом из st.secrets (для облака) ---
+# --- Получение ключа GigaChat ---
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "")
 if not GIGACHAT_CREDENTIALS and hasattr(st, "secrets"):
     GIGACHAT_CREDENTIALS = st.secrets.get("GIGACHAT_CREDENTIALS", "")
