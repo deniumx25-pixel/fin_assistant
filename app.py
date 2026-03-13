@@ -6,23 +6,38 @@ import re
 from collections import defaultdict
 import os
 import tempfile
+import subprocess
 
-# --- OCR dependencies (optional) ---
+# --- Проверка доступности OCR-компонентов в системе ---
+def check_tesseract():
+    """Проверяет, доступен ли Tesseract в системе."""
+    try:
+        subprocess.run(['tesseract', '--version'], capture_output=True, check=True)
+        return True
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
+
+def check_poppler():
+    """Проверяет, доступен ли pdftoppm (часть Poppler) в системе."""
+    try:
+        subprocess.run(['pdftoppm', '-v'], capture_output=True, check=True)
+        return True
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
+
+OCR_SYSTEM_AVAILABLE = check_tesseract() and check_poppler()
+
+# --- Импорт OCR-библиотек (опционально) ---
 try:
     import pytesseract
     from pdf2image import convert_from_path
     from PIL import Image
-    OCR_AVAILABLE = True
+    OCR_LIBS_AVAILABLE = True
 except ImportError:
-    OCR_AVAILABLE = False
+    OCR_LIBS_AVAILABLE = False
 
-# Пути к внешним программам (ваши конкретные)
-TESSERACT_PATH = r'C:\Users\deniu\AppData\Local\Programs\Tesseract-OCR\tesseract.exe'
-# Правильный путь к Poppler (бинарная папка)
-POPPLER_PATH = r'C:\Users\deniu\AppData\Local\Programs\poppler-25.12.0\Library\bin'
-
-if OCR_AVAILABLE:
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+# OCR доступен только если и библиотеки, и системные компоненты присутствуют
+OCR_AVAILABLE = OCR_LIBS_AVAILABLE and OCR_SYSTEM_AVAILABLE
 
 st.set_page_config(
     page_title="ИИ-ассистент финансового директора",
@@ -41,12 +56,18 @@ with st.sidebar:
     use_ocr = st.checkbox(
         "Использовать OCR для сканов",
         value=False,
-        help="Если страницы отсканированы, включите эту опцию (требуется Tesseract)."
+        help="Если страницы отсканированы, включите эту опцию (требуется Tesseract и Poppler)."
     )
     debug_mode = st.checkbox("Режим отладки", value=False, help="Показывать промежуточные данные извлечения.")
     
     if use_ocr and not OCR_AVAILABLE:
-        st.error("OCR недоступен: установите pytesseract и pdf2image")
+        if not OCR_LIBS_AVAILABLE:
+            st.error("Библиотеки OCR не установлены (pytesseract, pdf2image, pillow).")
+        elif not OCR_SYSTEM_AVAILABLE:
+            st.error("Системные компоненты OCR отсутствуют. Для работы OCR установите Tesseract и Poppler.")
+        else:
+            st.error("OCR недоступен по неизвестной причине.")
+        st.info("Отключите OCR для работы с текстовыми PDF.")
     
     # Информационное сообщение об ОФР появляется только при выборе 3 и более лет
     if years_to_analyze >= 3:
@@ -144,12 +165,14 @@ def parse_number(s):
         return None
 
 def extract_text_with_ocr(pdf_path, page_num):
-    """Извлекает текст со страницы PDF с помощью OCR (если включено)."""
+    """Извлекает текст со страницы PDF с помощью OCR (если включено и доступно)."""
     if not use_ocr or not OCR_AVAILABLE:
         return ""
     try:
-        images = convert_from_path(pdf_path, first_page=page_num+1, last_page=page_num+1, poppler_path=POPPLER_PATH)
+        # Полагаемся на PATH, не передаём poppler_path
+        images = convert_from_path(pdf_path, first_page=page_num+1, last_page=page_num+1)
         if images:
+            # pytesseract должен быть доступен через PATH
             text = pytesseract.image_to_string(images[0], lang='rus+eng')
             return text
     except Exception as e:
@@ -392,7 +415,6 @@ if uploaded_files:
     if len(years_to_use) >= 2:
         st.subheader("📉 Динамика коэффициентов")
 
-        # ---------- Новый блок: выбор коэффициентов с помощью чекбоксов ----------
         # Доступные коэффициенты (без пропусков)
         available_coeffs = list(df_coeff.columns)
 
@@ -465,7 +487,6 @@ if uploaded_files:
                 ax.grid(True)
                 st.pyplot(fig)
                 plt.close(fig)
-        # ---------- Конец нового блока ----------
     else:
         st.info("Для построения графика необходимо как минимум два года данных.")
 
