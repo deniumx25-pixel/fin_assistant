@@ -37,6 +37,8 @@ try:
     from pdf2image import convert_from_path
     from PIL import Image
     OCR_LIBS_AVAILABLE = True
+    # Принудительно указываем использовать tesseract из PATH
+    pytesseract.pytesseract.tesseract_cmd = 'tesseract'
 except ImportError:
     OCR_LIBS_AVAILABLE = False
 
