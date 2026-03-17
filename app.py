@@ -3,19 +3,27 @@ import pandas as pd
 import pdfplumber
 import matplotlib.pyplot as plt
 import re
+import cv2
+import numpy as np
 from collections import defaultdict
 import os
 import tempfile
 import subprocess
 import json
-from typing import Optional, List, Tuple, Set
+from typing import Optional, List, Tuple
 from dotenv import load_dotenv
+from PIL import Image
 
-# Загрузка переменных окружения из .env (только для локальной разработки)
 load_dotenv()
 
-# --- Проверка доступности OCR-компонентов в системе (через PATH) ---
+# ====================== ЛОКАЛЬНЫЕ ПУТИ К OCR ======================
+TESSERACT_PATH = r'C:\Users\deniu\AppData\Local\Programs\Tesseract-OCR\tesseract.exe'
+POPPLER_PATH   = r'C:\Users\deniu\AppData\Local\Programs\poppler-25.12.0\Library\bin'
+
+# --- Проверка доступности OCR-компонентов: сначала локальные пути, потом PATH ---
 def check_tesseract():
+    if os.path.isfile(TESSERACT_PATH):
+        return True
     try:
         subprocess.run(['tesseract', '--version'], capture_output=True, check=True)
         return True
@@ -23,6 +31,8 @@ def check_tesseract():
         return False
 
 def check_poppler():
+    if os.path.isfile(os.path.join(POPPLER_PATH, 'pdftoppm.exe')):
+        return True
     try:
         subprocess.run(['pdftoppm', '-v'], capture_output=True, check=True)
         return True
@@ -31,27 +41,27 @@ def check_poppler():
 
 OCR_SYSTEM_AVAILABLE = check_tesseract() and check_poppler()
 
-# --- Импорт OCR-библиотек (опционально) ---
+# --- Импорт OCR-библиотек ---
 try:
     import pytesseract
     from pdf2image import convert_from_path
-    from PIL import Image
     OCR_LIBS_AVAILABLE = True
-    # Принудительно указываем использовать tesseract из PATH
-    pytesseract.pytesseract.tesseract_cmd = 'tesseract'
+    if os.path.isfile(TESSERACT_PATH):
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    else:
+        pytesseract.pytesseract.tesseract_cmd = 'tesseract'
 except ImportError:
     OCR_LIBS_AVAILABLE = False
 
 OCR_AVAILABLE = OCR_LIBS_AVAILABLE and OCR_SYSTEM_AVAILABLE
 
-# --- Импорт GigaChat (только GigaChat) ---
+# --- Импорт GigaChat ---
 try:
     from gigachat import GigaChat
     GIGACHAT_AVAILABLE = True
 except ImportError:
     GIGACHAT_AVAILABLE = False
 
-# --- Получение ключа GigaChat ---
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "")
 if not GIGACHAT_CREDENTIALS and hasattr(st, "secrets"):
     GIGACHAT_CREDENTIALS = st.secrets.get("GIGACHAT_CREDENTIALS", "")
@@ -62,22 +72,25 @@ st.set_page_config(
     layout="wide"
 )
 
+# --- Инициализация session_state ---
+if 'manual_years' not in st.session_state:
+    st.session_state.manual_years = []
+if 'gigachat_done' not in st.session_state:
+    st.session_state.gigachat_done = False
+if 'processed_years' not in st.session_state:
+    st.session_state.processed_years = set()
+if 'last_gigachat_response' not in st.session_state:
+    st.session_state.last_gigachat_response = None
+if 'last_fill_changes' not in st.session_state:
+    st.session_state.last_fill_changes = []
+
 with st.sidebar:
     st.header("⚙️ Настройки")
-    years_to_analyze = st.slider(
-        "Количество лет для анализа",
-        min_value=1, max_value=10, value=3,
-        help="Сколько последних лет отчётности использовать для расчётов."
-    )
-    
+    years_to_analyze = st.slider("Количество лет для анализа", 1, 10, 3)
+
     with st.expander("📌 Примечание об ОФР"):
-        st.info(
-            "Отчёт о финансовых результатах (ОФР) содержит данные только за два года "
-            "(текущий и предыдущий). Для анализа за период более 2 лет загрузите ОФР "
-            "за соответствующие предыдущие годы."
-        )
-    
-    # --- Выбор отрасли ---
+        st.info("Отчёт о финансовых результатах (ОФР) содержит данные только за два года. Для анализа за период более 2 лет загрузите ОФР за соответствующие предыдущие годы.")
+
     industry_options = [
         "Промышленность (добывающая, обрабатывающая, энергетика)",
         "Сельское хозяйство",
@@ -90,57 +103,60 @@ with st.sidebar:
         "Металлургия",
         "Информационные технологии и IT-услуги"
     ]
-    industry = st.selectbox(
-        "Отрасль компании",
-        options=industry_options,
-        index=0,
-        help="Пороговые значения коэффициентов будут подобраны под выбранную отрасль."
-    )
-    
-    use_ocr = st.checkbox(
-        "Использовать OCR для сканов",
-        value=False,
-        help="Требуется Tesseract и Poppler (будут автоматически доступны в облаке)."
-    )
-    
+    industry = st.selectbox("Отрасль компании", options=industry_options, index=0)
+
+    use_ocr = st.checkbox("Использовать OCR для сканов", value=False)
+
     if use_ocr:
+        st.subheader("🔧 Качество OCR")
+        ocr_quality = st.select_slider("Качество распознавания",
+                                       options=["Быстрое", "Среднее", "Высокое"],
+                                       value="Среднее")
+        remove_lines = st.checkbox("Удалять линии таблиц", value=True)
+        psm_mode = st.selectbox("Режим распознавания (PSM)",
+                                options=[3, 6, 11, 12],
+                                index=1,
+                                format_func=lambda x: f"PSM {x} (авто:3, таблица:6, разреженный:11, переменный:12)")
+    else:
+        ocr_quality = "Среднее"
+
+    if use_ocr and not OCR_AVAILABLE:
         if not OCR_LIBS_AVAILABLE:
-            st.error("❌ Не установлены Python-библиотеки для OCR. Выполните:\n"
-                     "```bash\npip install pytesseract pdf2image pillow\n```")
+            st.error("❌ Не установлены Python-библиотеки для OCR. Выполните: pip install pytesseract pdf2image pillow opencv-python")
         elif not OCR_SYSTEM_AVAILABLE:
-            st.error("❌ Системные компоненты OCR отсутствуют. "
-                     "В облаке они будут установлены через packages.txt. "
-                     "Локально установите Tesseract и Poppler.")
+            st.error(f"❌ Системные компоненты OCR отсутствуют по указанным путям:\nTesseract: {TESSERACT_PATH}\nPoppler: {POPPLER_PATH}\nПроверьте, что файлы существуют.")
         else:
             st.success("✅ OCR готов к использованию.")
-    
+
     st.markdown("---")
     st.subheader("🤖 Нейросетевой анализ")
-    use_gigachat = st.checkbox(
-        "Использовать GigaChat для анализа пояснительных записок",
-        value=False,
-        help="Требуется ключ GigaChat (укажите в .env или secrets)."
-    )
-    fill_missing_with_ai = st.checkbox(
-        "Заполнять пропуски через GigaChat",
-        value=False,
-        help="Если данные не извлечены, GigaChat попытается найти их в тексте."
-    )
-    
+    use_gigachat = st.checkbox("Использовать GigaChat", value=False)
+    fill_missing_with_ai = st.checkbox("Заполнять пропуски через GigaChat", value=False)
+
     if use_gigachat and not GIGACHAT_AVAILABLE:
-        st.error("❌ Библиотека gigachat не установлена. Выполните:\n"
-                 "```bash\npip install gigachat\n```")
+        st.error("❌ Библиотека gigachat не установлена. Выполните: pip install gigachat")
     if use_gigachat and not GIGACHAT_CREDENTIALS:
         st.warning("⚠️ Не указан ключ GigaChat. Добавьте его в .env или Streamlit secrets.")
-    
+
     debug_mode = st.checkbox("Режим отладки", value=False)
 
+    manual_years_input = st.text_input(
+        "Годы для ручного сопоставления (через запятую, например 2024,2023,2022)",
+        value="",
+        help="Если таблица не содержит заголовков с годами, укажите годы в порядке от нового к старому (слева направо)."
+    )
+    if manual_years_input.strip():
+        try:
+            manual_years_list = [int(y.strip()) for y in manual_years_input.split(',') if y.strip().isdigit()]
+            st.session_state.manual_years = manual_years_list if manual_years_list else []
+        except:
+            st.warning("Неверный формат годов.")
+            st.session_state.manual_years = []
+    else:
+        st.session_state.manual_years = []
+
 st.title("🐍 ИИ-ассистент финансового директора")
-st.markdown("""
-Загрузите **PDF-файлы** с финансовой отчётностью (РСБУ).  
-Программа извлекает данные из таблиц по бухгалтерским кодам строк, при необходимости использует OCR.
-GigaChat может анализировать пояснительные записки и заполнять пропуски.
-""")
+st.markdown("Загрузите PDF-файлы с финансовой отчётностью (РСБУ). Программа извлекает данные из таблиц по бухгалтерским кодам строк, при необходимости использует OCR.")
 
 # ------------------- Константы -------------------
 CODE_TO_METRIC = {
@@ -317,7 +333,203 @@ GROUPS = {
 }
 WEIGHTS = {"Ликвидность": 0.2, "Рентабельность": 0.3, "Устойчивость": 0.3, "Активность": 0.2}
 
-# ------------------- Функции для извлечения данных -------------------
+# ------------------- Функции предобработки изображений -------------------
+def preprocess_for_ocr(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    if w < 1000:
+        scale_factor = 300 / (w / 8.27)
+        new_w = int(w * scale_factor)
+        new_h = int(h * scale_factor)
+        gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    coords = np.column_stack(np.where(gray > 0))
+    if coords.shape[0] > 0:
+        angle = cv2.minAreaRect(coords)[-1]
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+        (h, w) = gray.shape[:2]
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        gray = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    gray = cv2.fastNlMeansDenoising(gray, None, 30, 7, 21)
+    gray = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+    if remove_lines:
+        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+        horiz_lines = cv2.morphologyEx(gray, cv2.MORPH_OPEN, horiz_kernel)
+        vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+        vert_lines = cv2.morphologyEx(gray, cv2.MORPH_OPEN, vert_kernel)
+        gray = cv2.subtract(gray, horiz_lines)
+        gray = cv2.subtract(gray, vert_lines)
+    return gray
+
+def scale_image(image, factor):
+    h, w = image.shape[:2]
+    return cv2.resize(image, (int(w*factor), int(h*factor)), interpolation=cv2.INTER_CUBIC)
+
+def extract_text_with_ocr(pdf_path, page_num):
+    if not use_ocr or not OCR_AVAILABLE:
+        return ""
+    try:
+        images = convert_from_path(pdf_path, first_page=page_num+1, last_page=page_num+1, poppler_path=POPPLER_PATH)
+        if images:
+            img = np.array(images[0])
+            if ocr_quality == "Высокое":
+                img = scale_image(img, 3)
+            elif ocr_quality == "Среднее":
+                img = scale_image(img, 2)
+            img = preprocess_for_ocr(img)
+            psms = [psm_mode, 3, 6, 11, 12]
+            for psm in psms:
+                try:
+                    cfg = f'--psm {psm} -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.-'
+                    text = pytesseract.image_to_string(img, config=cfg, lang='rus+eng')
+                    if len(text.strip()) > 50:
+                        return text
+                except:
+                    continue
+            cfg = f'--psm {psm_mode} -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.-'
+            return pytesseract.image_to_string(img, config=cfg, lang='rus+eng')
+    except Exception as e:
+        if debug_mode:
+            st.warning(f"Ошибка OCR на странице {page_num}: {e}")
+    return ""
+
+def extract_full_text_from_pdf(pdf_path):
+    text = ""
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text() or ""
+                text += page_text + "\n"
+    except Exception as e:
+        if debug_mode:
+            st.warning(f"Ошибка извлечения текста: {e}")
+    return text
+
+def extract_data_from_pdf(pdf_path):
+    years_data = defaultdict(dict)
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                tables = page.extract_tables()
+                page_text = page.extract_text() or ""
+                if debug_mode:
+                    st.info(f"Страница {page_num}: найдено таблиц: {len(tables)}")
+                if (not tables or len(page_text) < 100) and use_ocr and OCR_AVAILABLE:
+                    ocr_text = extract_text_with_ocr(pdf_path, page_num)
+                    if ocr_text:
+                        lines = [line for line in ocr_text.split('\n') if line.strip()]
+                        if lines:
+                            tables = [[line] for line in lines]
+                            if debug_mode:
+                                st.info(f"Страница {page_num}: использован OCR (строк: {len(lines)})")
+                for table in tables:
+                    if not table:
+                        continue
+                    if isinstance(table[0], str):
+                        table = [[row] for row in table]
+                    table = [row for row in table if any(cell and str(cell).strip() for cell in row)]
+                    if not table:
+                        continue
+                    max_cols = max(len(row) for row in table)
+                    table = [row + [None] * (max_cols - len(row)) for row in table]
+
+                    year_indices = {}
+                    header_row = None
+                    for i, row in enumerate(table[:30]):
+                        for j, cell in enumerate(row):
+                            if cell:
+                                m = re.search(r'(20\d{2})', str(cell))
+                                if m:
+                                    year_indices[j] = int(m.group(1))
+                        if year_indices:
+                            header_row = i
+                            break
+
+                    code_col = None
+                    search_rows = []
+                    if header_row is not None:
+                        if header_row > 0:
+                            search_rows.append(header_row-1)
+                        search_rows.append(header_row)
+                        if header_row+1 < len(table):
+                            search_rows.append(header_row+1)
+                        if header_row+2 < len(table):
+                            search_rows.append(header_row+2)
+                    else:
+                        search_rows = list(range(min(5, len(table))))
+                    for r in search_rows:
+                        if r >= len(table):
+                            continue
+                        for j, cell in enumerate(table[r]):
+                            if cell and re.search(r'код|code|стр[ао]ки', str(cell).lower()):
+                                code_col = j
+                                break
+                        if code_col is not None:
+                            break
+                    if code_col is None:
+                        best = 0
+                        best_matches = -1
+                        start = header_row+1 if header_row is not None else 1
+                        end = min(start+15, len(table))
+                        for cand in range(4):
+                            matches = sum(1 for row in table[start:end] if len(row)>cand and str(row[cand]).strip() in CODE_TO_METRIC)
+                            if matches > best_matches:
+                                best_matches = matches
+                                best = cand
+                        code_col = best
+                    if code_col is None:
+                        code_col = 0
+                    if debug_mode:
+                        st.info(f"  Столбец кодов: {code_col}")
+
+                    if year_indices:
+                        for row in table[header_row+1:]:
+                            if not row or len(row) <= code_col:
+                                continue
+                            code = str(row[code_col]).strip()
+                            if code in CODE_TO_METRIC:
+                                metric = CODE_TO_METRIC[code]
+                                for j, year in year_indices.items():
+                                    if j < len(row):
+                                        val = parse_number(row[j])
+                                        if val is not None and metric not in years_data[year]:
+                                            years_data[year][metric] = val
+                                            if debug_mode:
+                                                st.info(f"    Найден {code} -> {metric} за {year}: {val}")
+                    else:
+                        manual = st.session_state.manual_years
+                        if manual:
+                            for row in table:
+                                if not row or len(row) <= code_col:
+                                    continue
+                                code = str(row[code_col]).strip()
+                                if code in CODE_TO_METRIC:
+                                    metric = CODE_TO_METRIC[code]
+                                    if len(row) == 1 and isinstance(row[0], str):
+                                        parts = row[0].split()
+                                        if len(parts) > 1:
+                                            vals = parts[1:] if parts[0] == code else parts
+                                            for i, year in enumerate(manual):
+                                                if i < len(vals):
+                                                    num = parse_number(vals[i])
+                                                    if num is not None and metric not in years_data[year]:
+                                                        years_data[year][metric] = num
+                                    else:
+                                        for i, year in enumerate(manual):
+                                            col = code_col + 1 + i
+                                            if col < len(row):
+                                                num = parse_number(row[col])
+                                                if num is not None and metric not in years_data[year]:
+                                                    years_data[year][metric] = num
+    except Exception as e:
+        if debug_mode:
+            st.error(f"Ошибка при извлечении данных: {e}")
+        return {}
+    return dict(years_data)
+
 def parse_number(s):
     s = str(s).strip()
     if not s:
@@ -347,199 +559,75 @@ def parse_number(s):
     except:
         return None
 
-def extract_text_with_ocr(pdf_path, page_num):
-    if not use_ocr or not OCR_AVAILABLE:
-        return ""
-    try:
-        # В облаке Poppler доступен через PATH, поэтому poppler_path не указываем
-        images = convert_from_path(pdf_path, first_page=page_num+1, last_page=page_num+1)
-        if images:
-            text = pytesseract.image_to_string(images[0], lang='rus+eng')
-            return text
-    except Exception as e:
-        if debug_mode:
-            st.warning(f"Ошибка OCR на странице {page_num}: {e}")
-    return ""
-
-def extract_full_text_from_pdf(pdf_path):
-    full_text = ""
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text() or ""
-                full_text += page_text + "\n"
-    except Exception as e:
-        if debug_mode:
-            st.warning(f"Ошибка извлечения текста: {e}")
-    return full_text
-
-def extract_data_from_pdf(pdf_path):
-    years_data = defaultdict(dict)
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page_num, page in enumerate(pdf.pages):
-                tables = page.extract_tables()
-                page_text = page.extract_text() or ""
-                if debug_mode:
-                    st.info(f"Страница {page_num}: найдено таблиц: {len(tables)}")
-                if (not tables or len(page_text) < 100) and use_ocr and OCR_AVAILABLE:
-                    ocr_text = extract_text_with_ocr(pdf_path, page_num)
-                    if ocr_text:
-                        lines = ocr_text.split('\n')
-                        ocr_table = []
-                        for line in lines:
-                            cells = re.split(r'\s{2,}', line.strip())
-                            if len(cells) > 1:
-                                ocr_table.append(cells)
-                        if ocr_table:
-                            tables = [ocr_table]
-                            if debug_mode:
-                                st.info(f"Страница {page_num}: использован OCR для извлечения таблицы.")
-                for table_idx, table in enumerate(tables):
-                    if not table or len(table) < 2:
-                        if debug_mode:
-                            st.info(f"  Таблица {table_idx}: слишком мало строк, пропущена")
-                        continue
-                    year_indices = {}
-                    header_row_idx = None
-                    for row_idx, row in enumerate(table[:20]):
-                        for col_idx, cell in enumerate(row):
-                            if cell:
-                                year_match = re.search(r'(20\d{2})', str(cell))
-                                if year_match:
-                                    year = int(year_match.group(1))
-                                    year_indices[col_idx] = year
-                        if year_indices:
-                            header_row_idx = row_idx
-                            break
-                    if not year_indices:
-                        if debug_mode:
-                            st.info(f"  Таблица {table_idx}: не найдены годы, пропущена")
-                        continue
-                    if debug_mode:
-                        st.info(f"  Таблица {table_idx}: найдены годы {dict(year_indices)} (строка {header_row_idx})")
-                    best_col = 0
-                    max_matches = -1
-                    for candidate_col in range(4):
-                        matches = 0
-                        for row in table[header_row_idx+1: header_row_idx+16]:
-                            if row and len(row) > candidate_col:
-                                code_cell = str(row[candidate_col]).strip()
-                                if code_cell in CODE_TO_METRIC:
-                                    matches += 1
-                        if matches > max_matches:
-                            max_matches = matches
-                            best_col = candidate_col
-                    code_col_idx = best_col
-                    if debug_mode:
-                        st.info(f"  Таблица {table_idx}: выбран столбец кодов {code_col_idx} (совпадений: {max_matches})")
-                    for row in table[header_row_idx + 1:]:
-                        if not row or len(row) <= code_col_idx:
-                            continue
-                        code_cell = str(row[code_col_idx]).strip()
-                        if code_cell in CODE_TO_METRIC:
-                            metric = CODE_TO_METRIC[code_cell]
-                            for col_idx, year in year_indices.items():
-                                if col_idx < len(row):
-                                    cell_val = row[col_idx]
-                                    if cell_val is not None:
-                                        num = parse_number(cell_val)
-                                        if num is not None:
-                                            if metric not in years_data[year]:
-                                                years_data[year][metric] = num
-                                                if debug_mode:
-                                                    st.info(f"    Найден код {code_cell} ({metric}) для года {year}: {num}")
-    except Exception as e:
-        if debug_mode:
-            st.error(f"Ошибка при извлечении данных из PDF: {e}")
-        return {}
-    return dict(years_data)
-
-# ------------------- Функции для GigaChat (упрощённые) -------------------
+# ------------------- Функции для GigaChat -------------------
 def analyze_with_gigachat(prompt: str) -> Optional[str]:
     if not use_gigachat or not GIGACHAT_AVAILABLE or not GIGACHAT_CREDENTIALS:
         return None
     try:
-        if debug_mode:
-            st.info("Попытка подключения к GigaChat...")
         with GigaChat(credentials=GIGACHAT_CREDENTIALS, verify_ssl_certs=False, scope='GIGACHAT_API_PERS') as giga:
             full_prompt = "Ты профессиональный финансовый аналитик.\n\n" + prompt
             response = giga.chat(full_prompt)
             return response.choices[0].message.content
     except Exception as e:
         if debug_mode:
-            st.error(f"Ошибка при обращении к GigaChat: {e}")
-            import traceback
-            st.error(traceback.format_exc())
+            st.error(f"Ошибка GigaChat: {e}")
         return None
 
-def format_metrics_summary(df_coeff: pd.DataFrame, df: pd.DataFrame) -> str:
-    summary = []
-    summary.append("ФИНАНСОВЫЕ МЕТРИКИ:")
+def format_metrics_summary(df_coeff, df):
+    summary = ["ФИНАНСОВЫЕ МЕТРИКИ:"]
     for year in df_coeff.index:
         summary.append(f"\n{year} год:")
-        for coeff in df_coeff.columns:
-            val = df_coeff.loc[year, coeff]
-            if pd.notna(val):
-                summary.append(f"- {coeff}: {val:.2f}")
+        for c in df_coeff.columns:
+            v = df_coeff.loc[year, c]
+            if pd.notna(v):
+                summary.append(f"- {c}: {v:.2f}")
     summary.append("\n\nКЛЮЧЕВЫЕ ПОКАЗАТЕЛИ:")
     for year in df.index:
         summary.append(f"\n{year} год:")
-        for metric in ["Выручка", "Чистая прибыль", "Активы"]:
-            if metric in df.columns:
-                val = df.loc[year, metric]
-                if pd.notna(val):
-                    summary.append(f"- {metric}: {val:,.0f} тыс. руб.")
+        for m in ["Выручка", "Чистая прибыль", "Активы"]:
+            if m in df.columns:
+                v = df.loc[year, m]
+                if pd.notna(v):
+                    summary.append(f"- {m}: {v:,.0f} тыс. руб.")
     return "\n".join(summary)
 
-def fill_missing_with_gigachat(df: pd.DataFrame, full_text: str, missing_candidates: List[Tuple[str, int]]) -> Tuple[pd.DataFrame, List[str]]:
+def fill_missing_with_gigachat(df, full_text, missing_candidates):
     if not missing_candidates:
         return df, []
-    
-    missing_by_year = defaultdict(list)
+    by_year = defaultdict(list)
     for code, year in missing_candidates:
-        missing_by_year[year].append(code)
-    
-    prompt = "В тексте пояснительной записки к бухгалтерской отчетности найди значения следующих показателей по кодам строк за указанные годы.\n"
-    prompt += "Если данные отсутствуют, укажи null. Ответ должен быть строго в формате JSON без дополнительного текста:\n"
-    prompt += "{\n"
-    for year in sorted(missing_by_year.keys()):
-        codes = missing_by_year[year]
+        by_year[year].append(code)
+    prompt = "В тексте пояснительной записки найди значения следующих показателей по кодам строк за указанные годы.\n"
+    prompt += "Ответ в формате JSON без лишнего текста:\n{\n"
+    for year in sorted(by_year):
+        codes = by_year[year]
         if codes:
             prompt += f'  "{year}": {{\n'
             for code in codes:
                 prompt += f'    "{code}": null,\n'
             prompt = prompt.rstrip(',\n') + '\n  },\n'
-    prompt = prompt.rstrip(',\n') + '\n}\n\n'
-    prompt += "Текст:\n" + full_text[:15000]
-    
-    response = analyze_with_gigachat(prompt)
-    if not response:
+    prompt = prompt.rstrip(',\n') + '\n}\n\nТекст:\n' + full_text[:15000]
+    resp = analyze_with_gigachat(prompt)
+    if not resp:
         return df, []
-    
     if debug_mode:
-        st.info(f"Ответ GigaChat: {response}")
-    
+        st.info(f"Ответ GigaChat: {resp}")
     try:
-        json_match = re.search(r'\{.*\}', response, re.DOTALL)
-        if json_match:
-            data = json.loads(json_match.group())
-        else:
-            data = json.loads(response)
+        m = re.search(r'\{.*\}', resp, re.DOTALL)
+        data = json.loads(m.group()) if m else json.loads(resp)
     except Exception as e:
         if debug_mode:
-            st.warning(f"Не удалось распарсить ответ GigaChat: {e}")
+            st.warning(f"Не удалось распарсить JSON: {e}")
         return df, []
-    
     changes = []
-    for year_str, values in data.items():
+    for year_str, vals in data.items():
         try:
             year = int(year_str)
         except:
             continue
         if year not in [y for _, y in missing_candidates]:
             continue
-        for code, val in values.items():
+        for code, val in vals.items():
             if code in CODE_TO_METRIC and val is not None:
                 metric = CODE_TO_METRIC[code]
                 if pd.isna(df.loc[year, metric]):
@@ -551,17 +639,7 @@ def fill_missing_with_gigachat(df: pd.DataFrame, full_text: str, missing_candida
                         pass
     return df, changes
 
-# ------------------- Инициализация состояния сессии -------------------
-if 'gigachat_done' not in st.session_state:
-    st.session_state.gigachat_done = False
-if 'processed_years' not in st.session_state:
-    st.session_state.processed_years = set()
-if 'last_gigachat_response' not in st.session_state:
-    st.session_state.last_gigachat_response = None
-if 'last_fill_changes' not in st.session_state:
-    st.session_state.last_fill_changes = []
-
-# ------------------- Загрузка файлов и основной анализ -------------------
+# ------------------- Загрузка файлов -------------------
 uploaded_files = st.file_uploader("📎 Загрузите PDF-файлы с отчётностью", type="pdf", accept_multiple_files=True)
 
 if uploaded_files:
@@ -569,68 +647,59 @@ if uploaded_files:
     full_texts = []
     current_years = set()
     for file in uploaded_files:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            tmp_file.write(file.getbuffer())
-            tmp_path = tmp_file.name
-        file_data = extract_data_from_pdf(tmp_path)
-        if file_data is None:
-            file_data = {}
-        full_text = extract_full_text_from_pdf(tmp_path)
-        if full_text:
-            full_texts.append(full_text)
-        for year, metrics in file_data.items():
-            current_years.add(year)
-            for metric, value in metrics.items():
-                if metric not in all_years_data[year]:
-                    all_years_data[year][metric] = value
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(file.getbuffer())
+            tmp_path = tmp.name
+        data = extract_data_from_pdf(tmp_path)
+        if data:
+            for year, metrics in data.items():
+                current_years.add(year)
+                for k, v in metrics.items():
+                    if k not in all_years_data[year]:
+                        all_years_data[year][k] = v
+        text = extract_full_text_from_pdf(tmp_path)
+        if text:
+            full_texts.append(text)
         os.unlink(tmp_path)
 
-    # Если появились новые года (которых не было в processed_years), сбрасываем флаг
     if current_years - st.session_state.processed_years:
         st.session_state.gigachat_done = False
         st.session_state.last_gigachat_response = None
         st.session_state.last_fill_changes = []
 
     if not all_years_data:
-        st.error("❌ Не удалось извлечь данные. Убедитесь, что в файлах есть таблицы с кодами строк и годами. Если страницы отсканированы, включите OCR.")
+        st.error("❌ Не удалось извлечь данные. Убедитесь, что в файлах есть таблицы с кодами строк и годами.")
         st.stop()
 
     df_raw = pd.DataFrame.from_dict(all_years_data, orient='index').sort_index()
-    for metric in KEY_METRICS:
-        if metric not in df_raw.columns:
-            df_raw[metric] = None
+    for m in KEY_METRICS:
+        if m not in df_raw.columns:
+            df_raw[m] = None
 
     years_list = ', '.join(map(str, df_raw.index.unique()))
     st.success(f"✅ Извлечены данные: {years_list}")
 
-    # ------------------- Проверка сходимости баланса (Актив = Пассив) -------------------
+    # Проверка баланса
     balance_errors = []
-    balance_ok_years = []
+    balance_ok = []
     for year in df_raw.index:
-        if ("Активы" in df_raw.columns and 
-            "Собственный капитал" in df_raw.columns and
-            "Долгосрочные обязательства" in df_raw.columns and
-            "Краткосрочные обязательства" in df_raw.columns):
-            
+        if all(col in df_raw.columns for col in ["Активы", "Собственный капитал", "Долгосрочные обязательства", "Краткосрочные обязательства"]):
             актив = df_raw.loc[year, "Активы"]
             кап = df_raw.loc[year, "Собственный капитал"]
             долг = df_raw.loc[year, "Долгосрочные обязательства"]
             крат = df_raw.loc[year, "Краткосрочные обязательства"]
-            
             if pd.notna(актив) and pd.notna(кап) and pd.notna(долг) and pd.notna(крат):
-                пассив_расчетный = кап + долг + крат
-                # Допустимая погрешность: 1% или 1 тыс. руб.
-                if abs(актив - пассив_расчетный) > max(1, abs(актив) * 0.01):
-                    balance_errors.append(f"{year} (актив {актив:,.0f} ≠ пассив {пассив_расчетный:,.0f})")
+                пассив = кап + долг + крат
+                if abs(актив - пассив) > max(1, abs(актив) * 0.01):
+                    balance_errors.append(f"{year} (актив {актив:,.0f} ≠ пассив {пассив:,.0f})")
                 else:
-                    balance_ok_years.append(year)
+                    balance_ok.append(year)
     if balance_errors:
-        st.warning(f"⚠️ Баланс не сходится по следующим годам: {', '.join(balance_errors)}")
+        st.warning(f"⚠️ Баланс не сходится по годам: {', '.join(balance_errors)}")
+    elif balance_ok:
+        st.success(f"✅ Актив и пассив сходятся по годам: {', '.join(map(str, balance_ok))}")
     else:
-        if balance_ok_years:
-            st.success(f"✅ Актив и пассив сходятся по всем проверенным годам: {', '.join(map(str, balance_ok_years))}")
-        else:
-            st.info("ℹ️ Недостаточно данных для проверки сходимости баланса.")
+        st.info("ℹ️ Недостаточно данных для проверки баланса.")
 
     years_available = sorted(df_raw.index.unique())
     years_to_use = years_available[-years_to_analyze:] if len(years_available) >= years_to_analyze else years_available
@@ -641,23 +710,23 @@ if uploaded_files:
                              "Чистая прибыль", "Прибыль (убыток) до налогообложения", "Проценты к уплате",
                              "Запасы", "Дебиторская задолженность"]
 
-    # ---------- Заполнение пропусков через GigaChat (только один раз) ----------
+    # Заполнение пропусков через GigaChat
     fill_changes = []
     if use_gigachat and fill_missing_with_ai and full_texts and GIGACHAT_AVAILABLE and GIGACHAT_CREDENTIALS and not st.session_state.gigachat_done:
-        missing_candidates = []
+        candidates = []
         for year in years_to_use:
-            balance_filled = any(pd.notna(df.loc[year].get(m)) for m in BALANCE_METRICS if m in df.columns)
-            income_filled = any(pd.notna(df.loc[year].get(m)) for m in INCOME_METRICS if m in df.columns)
+            bal_ok = any(pd.notna(df.loc[year].get(m)) for m in BALANCE_METRICS if m in df.columns)
+            inc_ok = any(pd.notna(df.loc[year].get(m)) for m in INCOME_METRICS if m in df.columns)
             for code, metric in CODE_TO_METRIC.items():
                 if metric not in df.columns or pd.isna(df.loc[year, metric]):
-                    if metric in BALANCE_METRICS and balance_filled:
-                        missing_candidates.append((code, year))
-                    elif metric in INCOME_METRICS and income_filled:
-                        missing_candidates.append((code, year))
-        if missing_candidates:
-            with st.spinner("GigaChat пытается найти недостающие данные в тексте..."):
-                combined_text = "\n".join(full_texts)
-                df, fill_changes = fill_missing_with_gigachat(df, combined_text, missing_candidates)
+                    if metric in BALANCE_METRICS and bal_ok:
+                        candidates.append((code, year))
+                    elif metric in INCOME_METRICS and inc_ok:
+                        candidates.append((code, year))
+        if candidates:
+            with st.spinner("GigaChat ищет недостающие данные..."):
+                combined = "\n".join(full_texts)
+                df, fill_changes = fill_missing_with_gigachat(df, combined, candidates)
                 st.session_state.last_fill_changes = fill_changes
         st.session_state.gigachat_done = True
         st.session_state.processed_years = set(df_raw.index)
@@ -666,18 +735,17 @@ if uploaded_files:
 
     if fill_changes:
         with st.expander("🤖 Данные, добавленные GigaChat"):
-            for change in fill_changes:
-                st.write(f"- {change}")
+            for c in fill_changes:
+                st.write(f"- {c}")
 
-    # Проверка наличия пассивных показателей и рекомендация
     missing_passive = []
     for year in years_to_use:
         for m in ["Долгосрочные обязательства", "Краткосрочные обязательства", "Собственный капитал"]:
             if pd.isna(df.loc[year].get(m)):
                 missing_passive.append(f"{year}: {m}")
     if missing_passive:
-        st.warning("⚠️ Не удалось автоматически извлечь некоторые показатели пассива (1400,1500,1300).")
-        st.info("💡 Возможно, таблица пассива находится на отдельной странице без указания годов. Рекомендуем объединить страницы актива и пассива в один PDF и загрузить заново, либо введите значения вручную в редакторе ниже, либо включите опцию 'Заполнять пропуски через GigaChat'.")
+        st.warning("⚠️ Не удалось извлечь некоторые показатели пассива (1400,1500,1300).")
+        st.info("💡 Рекомендуем объединить страницы актива и пассива в один PDF, либо ввести значения вручную в редакторе ниже.")
 
     missing = []
     for year in years_to_use:
@@ -690,38 +758,36 @@ if uploaded_files:
             st.write(f"- {msg}")
 
     st.subheader("✏️ Редактирование всех извлечённых данных")
-    editable_df = df[KEY_METRICS].T.reset_index()
-    editable_df.columns = ['Показатель'] + [str(col) for col in df.index]
-    edited = st.data_editor(editable_df, use_container_width=True, num_rows="dynamic", key="data_editor")
+    editable = df[KEY_METRICS].T.reset_index()
+    editable.columns = ['Показатель'] + [str(c) for c in df.index]
+    edited = st.data_editor(editable, use_container_width=True, num_rows="dynamic", key="editor")
     edited_years = [col for col in edited.columns if col != 'Показатель']
-    for year in edited_years:
-        for metric in KEY_METRICS:
-            row_idx = edited[edited['Показатель'] == metric].index
-            if not row_idx.empty:
-                val = edited.loc[row_idx[0], year]
+    for y in edited_years:
+        for m in KEY_METRICS:
+            row = edited[edited['Показатель'] == m].index
+            if not row.empty:
+                val = edited.loc[row[0], y]
                 try:
                     if val == "" or val is None:
-                        df.loc[int(year), metric] = None
+                        df.loc[int(y), m] = None
                     else:
-                        df.loc[int(year), metric] = float(val)
+                        df.loc[int(y), m] = float(val)
                 except:
-                    df.loc[int(year), metric] = None
+                    df.loc[int(y), m] = None
     st.success("✅ Данные обновлены.")
 
     st.subheader("📋 Источники данных")
-    col_bal, col_inc = st.columns(2)
-    with col_bal:
+    col1, col2 = st.columns(2)
+    with col1:
         st.markdown("**Показатели бухгалтерского баланса**")
         st.dataframe(df[BALANCE_METRICS].T.style.format("{:.2f}", na_rep="данные не найдены"))
-    with col_inc:
+    with col2:
         st.markdown("**Показатели отчёта о финансовых результатах**")
         st.dataframe(df[INCOME_METRICS].T.style.format("{:.2f}", na_rep="данные не найдены"))
 
     # Расчёт коэффициентов
     def safe_div(a, b):
-        if a is None or b is None or b == 0:
-            return None
-        return a / b
+        return a / b if a is not None and b is not None and b != 0 else None
     def safe_sub(a, b):
         return a - b if a is not None and b is not None else None
 
@@ -730,7 +796,7 @@ if uploaded_files:
         r = df.loc[year]
         долгоср = r.get("Долгосрочные обязательства")
         краткоср = r.get("Краткосрочные обязательства")
-        total_liabilities = долгоср + краткоср if долгоср is not None and краткоср is not None else None
+        total_liab = долгоср + краткоср if долгоср is not None and краткоср is not None else None
         coeff_dict[year] = {
             "Коэффициент текущей ликвидности": safe_div(r.get("Оборотные активы"), r.get("Краткосрочные обязательства")),
             "Коэффициент быстрой ликвидности": safe_div(safe_sub(r.get("Оборотные активы"), r.get("Запасы")), r.get("Краткосрочные обязательства")),
@@ -740,7 +806,7 @@ if uploaded_files:
             "Рентабельность продаж": safe_div(r.get("Чистая прибыль"), r.get("Выручка")),
             "Рентабельность до налогообложения": safe_div(r.get("Прибыль (убыток) до налогообложения"), r.get("Выручка")),
             "Коэффициент автономии": safe_div(r.get("Собственный капитал"), r.get("Активы")),
-            "Финансовый рычаг": safe_div(total_liabilities, r.get("Собственный капитал")),
+            "Финансовый рычаг": safe_div(total_liab, r.get("Собственный капитал")),
             "Покрытие процентов": safe_div(r.get("Прибыль (убыток) до налогообложения"), r.get("Проценты к уплате")),
             "Оборачиваемость активов": safe_div(r.get("Выручка"), r.get("Активы")),
             "Оборачиваемость дебиторской задолженности": safe_div(r.get("Выручка"), r.get("Дебиторская задолженность")),
@@ -752,217 +818,219 @@ if uploaded_files:
 
     if len(years_to_use) >= 2:
         st.subheader("📉 Динамика коэффициентов")
-        available_coeffs = list(df_coeff.columns)
-        for coeff in available_coeffs:
-            if f"show_{coeff}" not in st.session_state:
-                st.session_state[f"show_{coeff}"] = True
-
-        col_btn1, col_btn2, _ = st.columns([1, 1, 5])
-        with col_btn1:
-            if st.button("✓ Выбрать все", key="select_all_btn"):
-                for coeff in available_coeffs:
-                    st.session_state[f"show_{coeff}"] = True
+        avail = list(df_coeff.columns)
+        for c in avail:
+            if f"show_{c}" not in st.session_state:
+                st.session_state[f"show_{c}"] = True
+        b1, b2, _ = st.columns([1,1,5])
+        with b1:
+            if st.button("✓ Выбрать все", key="select_all"):
+                for c in avail:
+                    st.session_state[f"show_{c}"] = True
                 st.rerun()
-        with col_btn2:
-            if st.button("✗ Сбросить все", key="deselect_all_btn"):
-                for coeff in available_coeffs:
-                    st.session_state[f"show_{coeff}"] = False
+        with b2:
+            if st.button("✗ Сбросить все", key="deselect_all"):
+                for c in avail:
+                    st.session_state[f"show_{c}"] = False
                 st.rerun()
-
-        st.write("**Выберите коэффициенты для отображения:**")
-        num_cols = 3
-        cols = st.columns(num_cols)
-        for idx, coeff in enumerate(available_coeffs):
-            with cols[idx % num_cols]:
-                st.checkbox(coeff, key=f"show_{coeff}")
-
-        selected_coeffs = [coeff for coeff in available_coeffs if st.session_state[f"show_{coeff}"]]
-        split_option = st.checkbox("Разделить на отдельные графики", value=False)
-
-        if not selected_coeffs:
+        st.write("**Выберите коэффициенты:**")
+        cols = st.columns(3)
+        for i, c in enumerate(avail):
+            with cols[i % 3]:
+                st.checkbox(c, key=f"show_{c}")
+        selected = [c for c in avail if st.session_state[f"show_{c}"]]
+        split = st.checkbox("Разделить на отдельные графики", False)
+        if not selected:
             st.warning("Не выбрано ни одного коэффициента.")
         else:
-            if split_option:
+            if split:
                 n_cols = 2
-                rows = (len(selected_coeffs) + n_cols - 1) // n_cols
-                for row in range(rows):
-                    cols = st.columns(n_cols)
-                    for col_idx in range(n_cols):
-                        idx = row * n_cols + col_idx
-                        if idx < len(selected_coeffs):
-                            coeff = selected_coeffs[idx]
-                            with cols[col_idx]:
+                rows = (len(selected) + n_cols - 1) // n_cols
+                for r in range(rows):
+                    cs = st.columns(n_cols)
+                    for ci in range(n_cols):
+                        idx = r * n_cols + ci
+                        if idx < len(selected):
+                            c = selected[idx]
+                            with cs[ci]:
                                 fig, ax = plt.subplots(figsize=(8,4))
-                                ax.plot(df_coeff.index, df_coeff[coeff], marker='o', linewidth=2)
-                                ax.set_title(coeff)
+                                ax.plot(df_coeff.index, df_coeff[c], marker='o')
+                                ax.set_title(c)
                                 ax.set_xlabel("Год")
                                 ax.set_ylabel("Значение")
-                                ax.grid(True)
+                                ax.grid()
                                 st.pyplot(fig)
                                 plt.close(fig)
             else:
                 fig, ax = plt.subplots(figsize=(14,6))
-                for coeff in selected_coeffs:
-                    ax.plot(df_coeff.index, df_coeff[coeff], marker='o', label=coeff)
+                for c in selected:
+                    ax.plot(df_coeff.index, df_coeff[c], marker='o', label=c)
                 ax.legend(loc='upper left', bbox_to_anchor=(1,1))
                 ax.set_xlabel("Год")
-                ax.set_ylabel("Значение")
-                ax.grid(True)
+                ax.grid()
                 st.pyplot(fig)
                 plt.close(fig)
     else:
-        st.info("Для построения графика необходимо как минимум два года данных.")
+        st.info("Для графика нужно минимум два года.")
 
-    # Интегральная оценка (с использованием отраслевых порогов)
-    st.subheader("🏆 Интегральная оценка финансового состояния")
-    def normalize(value, low, high):
-        if pd.isna(value) or value is None:
+    # Интегральная оценка
+    st.subheader("🏆 Интегральная оценка")
+    def norm(val, low, high):
+        if pd.isna(val):
             return None
-        if value >= high:
+        if val >= high:
             return 100
-        elif value <= low:
+        if val <= low:
             return 0
-        else:
-            return (value - low) / (high - low) * 100
+        return (val - low) / (high - low) * 100
 
-    scores_by_year = {}
+    scores = {}
     for year in years_to_use:
         total = 0
-        group_scores = {}
-        for group, coeff_list in GROUPS.items():
-            group_sum = 0
-            count = 0
-            for c in coeff_list:
-                val = df_coeff.loc[year, c] if c in df_coeff.columns else None
+        groups = {}
+        for group, coeffs in GROUPS.items():
+            gsum = 0
+            cnt = 0
+            for c in coeffs:
+                v = df_coeff.loc[year, c] if c in df_coeff.columns else None
                 if c in current_thresholds:
-                    low, high = current_thresholds[c]
-                    norm = normalize(val, low, high)
-                    if norm is not None:
-                        group_sum += norm
-                        count += 1
-            if count > 0:
-                group_avg = group_sum / count
-                group_scores[group] = group_avg
-                total += group_avg * WEIGHTS[group]
-        scores_by_year[year] = {"total": total, "groups": group_scores}
-    avg_total = sum(scores_by_year[year]["total"] for year in years_to_use) / len(years_to_use)
-    st.metric("Средний интегральный балл за период", f"{avg_total:.1f} / 100")
-    num_years = len(years_to_use)
-    cols_per_row = 4
-    for i in range(0, num_years, cols_per_row):
-        cols = st.columns(min(cols_per_row, num_years - i))
-        for j, year in enumerate(years_to_use[i:i+cols_per_row]):
+                    lo, hi = current_thresholds[c]
+                    n = norm(v, lo, hi)
+                    if n is not None:
+                        gsum += n
+                        cnt += 1
+            if cnt > 0:
+                groups[group] = gsum / cnt
+                total += groups[group] * WEIGHTS[group]
+        scores[year] = (total, groups)
+    avg_total = sum(t for t,_ in scores.values()) / len(scores)
+    st.metric("Средний интегральный балл", f"{avg_total:.1f} / 100")
+    num = len(years_to_use)
+    cpr = 4
+    for i in range(0, num, cpr):
+        cols = st.columns(min(cpr, num - i))
+        for j, year in enumerate(years_to_use[i:i+cpr]):
             with cols[j]:
-                st.metric(f"{year} год", f"{scores_by_year[year]['total']:.1f} / 100")
-                for g, s in scores_by_year[year]['groups'].items():
+                total, groups = scores[year]
+                st.metric(f"{year} год", f"{total:.1f} / 100")
+                for g, s in groups.items():
                     st.write(f"{g}: {s:.1f}")
 
-    # Анализ рисков (с отраслевыми порогами)
+    # Анализ рисков
     st.subheader("⚠️ Анализ потенциальных рисков")
-    risks_by_year = defaultdict(list)
+    risks = defaultdict(list)
     for year in years_to_use:
-        year_data = df.loc[year]
-        missing_count = sum(pd.isna(year_data.get(m)) for m in required_for_analysis)
-        if missing_count > 3:
-            risks_by_year[year].append(f"⚠️ Недостаточно данных: пропущено {missing_count} показателей.")
-        for coeff_name, value in df_coeff.loc[year].items():
-            if pd.isna(value):
+        miss = sum(pd.isna(df.loc[year].get(m)) for m in required_for_analysis)
+        if miss > 3:
+            risks[year].append(f"⚠️ Недостаточно данных: пропущено {miss} показателей.")
+        for c, v in df_coeff.loc[year].items():
+            if pd.isna(v):
                 continue
-            if coeff_name in current_thresholds:
-                low, high = current_thresholds[coeff_name]
-                if value < low:
-                    risks_by_year[year].append(f"{coeff_name} = {value:.2f} (ниже нормы {low:.2f})")
-                elif value > high * 1.5 and coeff_name in ["Финансовый рычаг", "Оборачиваемость активов"]:
-                    risks_by_year[year].append(f"{coeff_name} = {value:.2f} (чрезмерно высок)")
-    def problem_word(count):
-        if count % 10 == 1 and count % 100 != 11:
+            if c in current_thresholds:
+                lo, hi = current_thresholds[c]
+                if v < lo:
+                    risks[year].append(f"{c} = {v:.2f} (ниже нормы {lo:.2f})")
+                elif v > hi * 1.5 and c in ["Финансовый рычаг", "Оборачиваемость активов"]:
+                    risks[year].append(f"{c} = {v:.2f} (чрезмерно высок)")
+    def prob_word(cnt):
+        if cnt % 10 == 1 and cnt % 100 != 11:
             return "проблема"
-        elif 2 <= count % 10 <= 4 and (count % 100 < 10 or count % 100 >= 20):
+        if 2 <= cnt % 10 <= 4 and (cnt % 100 < 10 or cnt % 100 >= 20):
             return "проблемы"
-        else:
-            return "проблем"
+        return "проблем"
     if len(years_to_use) >= 2:
         for year in years_to_use:
-            risk_list = risks_by_year.get(year, [])
-            count = len(risk_list)
-            word = problem_word(count)
-            if risk_list:
-                with st.expander(f"**{year} год: {count} {word}**"):
-                    for r in risk_list:
+            lst = risks.get(year, [])
+            cnt = len(lst)
+            w = prob_word(cnt)
+            if lst:
+                with st.expander(f"**{year} год: {cnt} {w}**"):
+                    for r in lst:
                         st.write(f"- {r}")
             else:
                 with st.expander(f"**{year} год: 0 проблем**"):
                     st.success("Проблем не обнаружено.")
     else:
-        if risks_by_year:
-            for year, risk_list in risks_by_year.items():
-                count = len(risk_list)
-                word = problem_word(count)
-                st.warning(f"**{year} год: {count} {word}**")
-                for r in risk_list:
+        if risks:
+            for year, lst in risks.items():
+                cnt = len(lst)
+                w = prob_word(cnt)
+                st.warning(f"**{year} год: {cnt} {w}**")
+                for r in lst:
                     st.write(f"- {r}")
         else:
-            st.success("По коэффициентам значительных отклонений не обнаружено.")
+            st.success("По коэффициентам отклонений не обнаружено.")
 
-    # Анализ повторяемости (с отраслевыми порогами)
+    # ---------- Анализ повторяемости рисков (исправленный блок) ----------
     if len(years_to_use) >= 2:
         with st.expander("🔁 Анализ повторяемости рисков"):
-            risk_patterns = defaultdict(list)
+            patterns = defaultdict(list)
             for year in years_to_use:
-                for coeff_name, value in df_coeff.loc[year].items():
-                    if pd.isna(value):
+                for c, v in df_coeff.loc[year].items():
+                    if pd.isna(v):
                         continue
-                    if coeff_name in current_thresholds:
-                        low, high = current_thresholds[coeff_name]
-                        if value < low:
-                            risk_patterns[coeff_name].append((year, "ниже нормы"))
-                        elif value > high * 1.5 and coeff_name in ["Финансовый рычаг", "Оборачиваемость активов"]:
-                            risk_patterns[coeff_name].append((year, "чрезмерно высок"))
-            def year_word(num):
-                if num % 10 == 1 and num % 100 != 11:
-                    return "год"
-                elif 2 <= num % 10 <= 4 and (num % 100 < 10 or num % 100 >= 20):
-                    return "года"
-                else:
-                    return "лет"
-            found_pattern = False
-            for coeff_name, occurrences in risk_patterns.items():
-                if len(occurrences) >= 2:
-                    found_pattern = True
-                    years = [str(y) for y,_ in occurrences]
-                    years_sorted = sorted([y for y,_ in occurrences])
-                    intervals = [years_sorted[i]-years_sorted[i-1] for i in range(1,len(years_sorted))]
+                    if c in current_thresholds:
+                        lo, hi = current_thresholds[c]
+                        if v < lo:
+                            patterns[c].append((year, "ниже нормы"))
+                        elif v > hi * 1.5 and c in ["Финансовый рычаг", "Оборачиваемость активов"]:
+                            patterns[c].append((year, "чрезмерно высок"))
+            found = False
+            for c, occ in patterns.items():
+                if len(occ) >= 2:
+                    found = True
+                    years = [str(y) for y,_ in occ]
+                    yrs = sorted([y for y,_ in occ])
+                    intervals = [yrs[i]-yrs[i-1] for i in range(1,len(yrs))]
+                    
+                    # Формирование сообщения о повторяемости
                     if intervals:
-                        interval_str = ", ".join(map(str, intervals))
-                        st.warning(f"**{coeff_name}** повторяется в годах: {', '.join(years)}. Интервалы: {interval_str} {year_word(intervals[0]) if len(intervals)==1 else 'лет'}.")
+                        if all(i == 1 for i in intervals):
+                            freq_msg = "постоянная проблема (каждый год)"
+                        elif len(set(intervals)) == 1:
+                            interval = intervals[0]
+                            # склонение для "раз в X лет"
+                            if interval % 10 == 1 and interval % 100 != 11:
+                                year_word = "год"
+                            elif 2 <= interval % 10 <= 4 and (interval % 100 < 10 or interval % 100 >= 20):
+                                year_word = "года"
+                            else:
+                                year_word = "лет"
+                            freq_msg = f"раз в {interval} {year_word}"
+                        else:
+                            # разные интервалы
+                            int_str = ", ".join(map(str, intervals))
+                            freq_msg = f"интервалы: {int_str} лет"
                     else:
-                        st.warning(f"**{coeff_name}** повторяется в годах: {', '.join(years)}.")
-            if not found_pattern:
+                        freq_msg = ""
+                    
+                    st.markdown(f"**{c}** повторяется в годах: {', '.join(years)}. {freq_msg}")
+            if not found:
                 st.info("Нет повторяющихся рисков.")
 
-    # Рекомендации (с отраслевыми порогами)
+    # Рекомендации
     st.subheader("💡 Рекомендации для менеджмента")
-    avg_coeff = df_coeff.mean()
-    recommendations = []
-    for coeff_name, avg_val in avg_coeff.items():
-        if pd.isna(avg_val):
+    avg = df_coeff.mean()
+    recs = []
+    for c, v in avg.items():
+        if pd.isna(v):
             continue
-        if coeff_name in current_thresholds:
-            low, high = current_thresholds[coeff_name]
-            if avg_val < low:
-                action = ("увеличить ликвидность" if "ликвидности" in coeff_name else
-                          "повысить рентабельность" if "RO" in coeff_name or "Рентабельность" in coeff_name else
-                          "снизить долговую нагрузку" if "рычаг" in coeff_name else
+        if c in current_thresholds:
+            lo, hi = current_thresholds[c]
+            if v < lo:
+                action = ("увеличить ликвидность" if "ликвидности" in c else
+                          "повысить рентабельность" if "RO" in c or "Рентабельность" in c else
+                          "снизить долговую нагрузку" if "рычаг" in c else
                           "оптимизировать управление")
-                recommendations.append(f"🔻 **{coeff_name}** (средний {avg_val:.2f}) ниже нормы. Рекомендуется: {action}.")
-            elif avg_val > high and coeff_name in ["Финансовый рычаг", "Оборачиваемость активов"]:
-                recommendations.append(f"🔺 **{coeff_name}** (средний {avg_val:.2f}) выше нормы. Возможно избыточное использование заёмных средств.")
-    if not recommendations:
-        recommendations.append("Все ключевые показатели в норме. Рекомендуется поддерживать текущую политику.")
-    for rec in recommendations:
-        st.write(rec)
+                recs.append(f"🔻 **{c}** (средний {v:.2f}) ниже нормы. Рекомендуется: {action}.")
+            elif v > hi and c in ["Финансовый рычаг", "Оборачиваемость активов"]:
+                recs.append(f"🔺 **{c}** (средний {v:.2f}) выше нормы. Возможно избыточное использование заёмных средств.")
+    if not recs:
+        recs.append("Все ключевые показатели в норме. Рекомендуется поддерживать текущую политику.")
+    for r in recs:
+        st.write(r)
 
-    # Нейросетевой анализ (полнотекстовый) – один раз
+       # Нейросетевой анализ (полнотекстовый) – один раз
     if use_gigachat and full_texts and GIGACHAT_AVAILABLE and GIGACHAT_CREDENTIALS:
         st.subheader("🤖 Анализ пояснительной записки (GigaChat)")
         if st.session_state.last_gigachat_response is not None:
@@ -1008,22 +1076,22 @@ if uploaded_files:
                     st.error("Не удалось получить анализ от GigaChat.")
 
     # Качество данных
-    total_cells = len(KEY_METRICS) * len(years_to_use)
+    total = len(KEY_METRICS) * len(years_to_use)
     filled = df[KEY_METRICS].notna().sum().sum()
-    missing_count = total_cells - filled
-    quality = filled / total_cells if total_cells else 0
-    reliability = max(10, 100 - 20 * missing_count)
+    missing = total - filled
+    qual = filled / total if total else 0
+    reliab = max(10, 100 - 20 * missing)
     st.markdown("---")
-    col_q1, col_q2 = st.columns(2)
-    with col_q1:
-        st.metric("📊 Качество распознавания (доля заполненных)", f"{quality:.0%}")
-    with col_q2:
-        st.metric("🛡️ Надёжность данных (штраф за пропуски)", f"{reliability:.0f}%")
-    if missing_count > 0:
-        st.caption(f"Пропущено {missing_count} значений. Каждый пропуск снижает надёжность на 20% (минимум 10%).")
-    if quality < 0.7:
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.metric("📊 Качество распознавания (доля заполненных)", f"{qual:.0%}")
+    with col_b:
+        st.metric("🛡️ Надёжность данных (штраф за пропуски)", f"{reliab:.0f}%")
+    if missing:
+        st.caption(f"Пропущено {missing} значений. Каждый пропуск снижает надёжность на 20% (минимум 10%).")
+    if qual < 0.7:
         st.error("📌 Рекомендуется использовать более чёткие отчёты или проверить наличие кодов строк.")
-    elif quality < 0.9:
+    elif qual < 0.9:
         st.warning("📌 Часть данных не извлечена, возможны неточности.")
     else:
         st.success("📌 Данные пригодны для анализа.")
